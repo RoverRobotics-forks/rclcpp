@@ -1,3 +1,4 @@
+// Copyright 2019 Dan Rose
 // Copyright 2014 Open Source Robotics Foundation, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,237 +30,138 @@
 
 namespace rclcpp
 {
-
-template<typename MessageT, typename Alloc>
-class AnySubscriptionCallback
+template<typename MessageT>
+class AbstractSubscriptionCallback
 {
+protected:
+  // Argument type if callback is taking ownership of the object
+  using MessageMoveArg = MessageT &&;
+  // Most general argument type if callback only needs the message temporarily
+  using MessagePeekArg = const MessageT &;
+  // Most general argument type if callback needs a copy of the message
+  // note that this can be implicitly promoted to a shared_ptr if the callback needs
+  using MessageCopyArg = std::unique_ptr<MessageT>;
+  // Most general argument type if callback can share the message with other subscribers or
+  // publishers.
+  using MessageShareArg = const std::shared_ptr<const MessageT> &;
+
+public:
+  using UniquePtr = std::unique_ptr<AbstractSubscriptionCallback<MessageT>>;
+
+  virtual bool use_take_shared_method() const = 0;
+  virtual void dispatch(MessagePeekArg, const rmw_message_info_t &) const = 0;
+  virtual void dispatch_shared(MessageShareArg, const rmw_message_info_t &) const = 0;
+  virtual void dispatch_exclusive(MessageT &&, const rmw_message_info_t &) const = 0;
+  virtual rcl_allocator_t get_rcl_allocator() const = 0;
+};
+
+template<typename MessageT>
+using AnySubscriptionCallback = std::reference_wrapper<AbstractSubscriptionCallback<MessageT>>;
+
+template<typename MessageT, typename CallbackT, typename Alloc = std::allocator<void>>
+class SubscriptionCallback : public AbstractSubscriptionCallback<MessageT>
+{
+protected:
   using MessageAllocTraits = allocator::AllocRebind<MessageT, Alloc>;
   using MessageAlloc = typename MessageAllocTraits::allocator_type;
   using MessageDeleter = allocator::Deleter<MessageAlloc, MessageT>;
-  using ConstMessageSharedPtr = std::shared_ptr<const MessageT>;
-  using MessageUniquePtr = std::unique_ptr<MessageT, MessageDeleter>;
 
-  using SharedPtrCallback = std::function<void (const std::shared_ptr<MessageT>)>;
-  using SharedPtrWithInfoCallback =
-    std::function<void (const std::shared_ptr<MessageT>, const rmw_message_info_t &)>;
-  using ConstSharedPtrCallback = std::function<void (const std::shared_ptr<const MessageT>)>;
-  using ConstSharedPtrWithInfoCallback =
-    std::function<void (const std::shared_ptr<const MessageT>, const rmw_message_info_t &)>;
-  using UniquePtrCallback = std::function<void (MessageUniquePtr)>;
-  using UniquePtrWithInfoCallback =
-    std::function<void (MessageUniquePtr, const rmw_message_info_t &)>;
-  using ConstRefCallback = std::function<void (const MessageT &)>;
-  using ConstRefWithInfoCallback =
-    std::function<void (const MessageT &, const rmw_message_info_t &)>;
+  template <typename ArgT>
+  using Callback = std::function<void(ArgT)>;
 
-  SharedPtrCallback shared_ptr_callback_;
-  SharedPtrWithInfoCallback shared_ptr_with_info_callback_;
-  ConstSharedPtrCallback const_shared_ptr_callback_;
-  ConstSharedPtrWithInfoCallback const_shared_ptr_with_info_callback_;
-  UniquePtrCallback unique_ptr_callback_;
-  UniquePtrWithInfoCallback unique_ptr_with_info_callback_;
-  ConstRefCallback const_ref_callback_;
-  ConstRefWithInfoCallback const_ref_with_info_callback_;
+  template <typename ArgT>
+  using CallbackWithInfo = std::function<void(ArgT, const rmw_message_info_t &)>;
+
+protected:
+  CallbackT callback;
+  MessageAlloc message_allocator;
+  MessageDeleter message_deleter;
 
 public:
-  explicit AnySubscriptionCallback(std::shared_ptr<Alloc> allocator)
-  : shared_ptr_callback_(nullptr), shared_ptr_with_info_callback_(nullptr),
-    const_shared_ptr_callback_(nullptr), const_shared_ptr_with_info_callback_(nullptr),
-    unique_ptr_callback_(nullptr), unique_ptr_with_info_callback_(nullptr)
+  explicit SubscriptionCallback(CallbackT callback, const Alloc && allocator)
+  : callback(callback), message_allocator(allocator)
   {
-    message_allocator_ = std::make_shared<MessageAlloc>(*allocator.get());
-    allocator::set_allocator_for_deleter(&message_deleter_, message_allocator_.get());
+    allocator::set_allocator_for_deleter(&message_deleter, &message_allocator);
   }
 
-  AnySubscriptionCallback(const AnySubscriptionCallback &) = default;
-
-  template<
-    typename CallbackT,
-    typename std::enable_if<
-      rclcpp::function_traits::same_arguments<
-        CallbackT,
-        SharedPtrCallback
-      >::value
-    >::type * = nullptr
-  >
-  void set(CallbackT callback)
+  virtual void dispatch(const MessageT & msg, const rmw_message_info_t & info) const override
   {
-    shared_ptr_callback_ = callback;
+    dispatch_impl(callback, msg, info);
   }
 
-  template<
-    typename CallbackT,
-    typename std::enable_if<
-      rclcpp::function_traits::same_arguments<
-        CallbackT,
-        SharedPtrWithInfoCallback
-      >::value
-    >::type * = nullptr
-  >
-  void set(CallbackT callback)
+  virtual void dispatch_intra_process(MessageShareArg msg, const rmw_message_info_t &msg_info) const {
+    dispatch_shared_impl(callback,msg_info);
+  }
+  virtual void dispatch_intra_process(MessageShareArg msg, const rmw_message_info_t &msg_info) const {
+    dispatch_shared_impl(callback, msg_info);
+  }
+  virtual rcl_allocator_t get_rcl_allocator() const override
   {
-    shared_ptr_with_info_callback_ = callback;
+    return rclcpp::allocator::get_rcl_allocator<MessageT>(message_allocator);
+  }
+  virtual bool use_take_shared_method() const override
+  {
+    return (std::is_constructible<Callback<MessageShareArg>, CallbackT>::value) ||
+           (std::is_constructible<CallbackWithInfo<MessageShareArg>, CallbackT>::value);
   }
 
-  template<
-    typename CallbackT,
-    typename std::enable_if<
-      rclcpp::function_traits::same_arguments<
-        CallbackT,
-        ConstSharedPtrCallback
-      >::value
-    >::type * = nullptr
-  >
-  void set(CallbackT callback)
+protected:
+  void dispatch_impl(Callback<MessagePeekArg> f, MessagePeekArg msg, rmw_message_info_t const &)
   {
-    const_shared_ptr_callback_ = callback;
+    f(msg);
   }
 
-  template<
-    typename CallbackT,
-    typename std::enable_if<
-      rclcpp::function_traits::same_arguments<
-        CallbackT,
-        UniquePtrCallback
-      >::value
-    >::type * = nullptr
-  >
-  void set(CallbackT callback)
+  void dispatch_impl(
+    CallbackWithInfo<MessagePeekArg> f, MessagePeekArg msg, rmw_message_info_t const & info)
   {
-    unique_ptr_callback_ = callback;
+    f(msg, info);
   }
 
-  template<
-    typename CallbackT,
-    typename std::enable_if<
-      rclcpp::function_traits::same_arguments<
-        CallbackT,
-        UniquePtrWithInfoCallback
-      >::value
-    >::type * = nullptr
-  >
-  void set(CallbackT callback)
+  void dispatch_impl(Callback<MessageCopyArg> f, MessagePeekArg msg, const rmw_message_info_t &)
   {
-    unique_ptr_with_info_callback_ = callback;
+    auto ptr = MessageAllocTraits::allocate(message_allocator, 1);
+    MessageAllocTraits::construct(message_allocator, ptr, msg);
+    f(std::unique_ptr<MessageT>(msg, message_deleter));
+  }
+
+  void dispatch_impl(
+    CallbackWithInfo<MessageCopyArg> f, MessagePeekArg msg, const rmw_message_info_t & info)
+  {
+    auto ptr = MessageAllocTraits::allocate(*message_allocator, 1);
+    MessageAllocTraits::construct(message_allocator, ptr, msg);
+    f(std::unique_ptr<MessageT>(msg, message_deleter), info);
+  }
+
+  void dispatch_shared_impl(
+    Callback<MessageShareArg> fn, MessageShareArg msg, rmw_message_info_t const &)
+  {
+    fn(msg);
+  }
+
+  void dispatch_shared_impl(
+    CallbackWithInfo<MessageShareArg> fn, MessageShareArg msg, rmw_message_info_t const & info)
+  {
+    fn(msg, info);
   }
 
   template<
-    typename CallbackT,
-    typename std::enable_if<
-      rclcpp::function_traits::same_arguments<
-        CallbackT,
-        ConstRefCallback
-      >::value
-    >::type * = nullptr
-  >
-  void set(CallbackT callback)
+    typename T_ = CallbackT,
+    typename = std::enable_if<
+      !(std::is_constructible<Callback<MessageShareArg>, T_>::value ||
+      std::is_constructible<CallbackWithInfo<MessageShareArg>, T_>::value)>>
+  void dispatch_shared_impl(T_ && t, MessageShareArg msg, rmw_message_info_t const & info)
   {
-    const_ref_callback_ = callback;
+    MessagePeekArg msg_peek = *msg;
+    dispatch_impl(std::forward(t), msg_peek, info);
   }
-
-  template<
-    typename CallbackT,
-    typename std::enable_if<
-      rclcpp::function_traits::same_arguments<
-        CallbackT,
-        const_ref_with_info_callback_
-      >::value
-    >::type * = nullptr
-  >
-  void set(CallbackT callback)
-  {
-    const_ref_with_info_callback_ = callback;
-  }
-
-  void dispatch(
-    std::shared_ptr<MessageT> message, const rmw_message_info_t & message_info)
-  {
-    if (shared_ptr_callback_) {
-      shared_ptr_callback_(message);
-    } else if (shared_ptr_with_info_callback_) {
-      shared_ptr_with_info_callback_(message, message_info);
-    } else if (const_shared_ptr_callback_) {
-      const_shared_ptr_callback_(message);
-    } else if (const_shared_ptr_with_info_callback_) {
-      const_shared_ptr_with_info_callback_(message, message_info);
-    } else if (unique_ptr_callback_) {
-      auto ptr = MessageAllocTraits::allocate(*message_allocator_.get(), 1);
-      MessageAllocTraits::construct(*message_allocator_.get(), ptr, *message);
-      unique_ptr_callback_(MessageUniquePtr(ptr, message_deleter_));
-    } else if (unique_ptr_with_info_callback_) {
-      auto ptr = MessageAllocTraits::allocate(*message_allocator_.get(), 1);
-      MessageAllocTraits::construct(*message_allocator_.get(), ptr, *message);
-      unique_ptr_with_info_callback_(MessageUniquePtr(ptr, message_deleter_), message_info);
-    } else if (const_ref_callback_) {
-      const_ref_callback_(*message);
-    } else if (const_ref_with_info_callback_) {
-      const_ref_with_info_callback_(*message, message_info);
-    } else {
-      throw std::runtime_error("unexpected message without any callback set");
-    }
-  }
-
-  void dispatch_intra_process(
-    ConstMessageSharedPtr message, const rmw_message_info_t & message_info)
-  {
-    if (const_shared_ptr_callback_) {
-      const_shared_ptr_callback_(message);
-    } else if (const_shared_ptr_with_info_callback_) {
-      const_shared_ptr_with_info_callback_(message, message_info);
-    } else if (const_ref_callback_) {
-      const_ref_callback_(*message);
-    } else if (const_ref_with_info_callback_) {
-      const_ref_with_info_callback_(*message);
-    } else {
-      if (
-        unique_ptr_callback_ || unique_ptr_with_info_callback_ ||
-        shared_ptr_callback_ || shared_ptr_with_info_callback_)
-      {
-        throw std::runtime_error(
-                "unexpected dispatch_intra_process const shared "
-                "message call with no const shared_ptr callback");
-      } else {
-        throw std::runtime_error("unexpected message without any callback set");
-      }
-    }
-  }
-
-  void dispatch_intra_process(
-    MessageUniquePtr message, const rmw_message_info_t & message_info)
-  {
-    if (shared_ptr_callback_) {
-      typename std::shared_ptr<MessageT> shared_message = std::move(message);
-      shared_ptr_callback_(shared_message);
-    } else if (shared_ptr_with_info_callback_) {
-      typename std::shared_ptr<MessageT> shared_message = std::move(message);
-      shared_ptr_with_info_callback_(shared_message, message_info);
-    } else if (unique_ptr_callback_) {
-      unique_ptr_callback_(std::move(message));
-    } else if (unique_ptr_with_info_callback_) {
-      unique_ptr_with_info_callback_(std::move(message), message_info);
-    } else if (const_ref_callback_) {
-      const_ref_callback_(*message);
-    } else if (const_ref_with_info_callback_) {
-      const_ref_with_info_callback_(*message, message_info);
-    } else if (const_shared_ptr_callback_ || const_shared_ptr_with_info_callback_) {
-      throw std::runtime_error(
-              "unexpected dispatch_intra_process unique message call"
-              " with const shared_ptr callback");
-    } else {
-      throw std::runtime_error("unexpected message without any callback set");
-    }
-  }
-
-  bool use_take_shared_method()
-  {
-    return const_shared_ptr_callback_ || const_shared_ptr_with_info_callback_;
-  }
-
-private:
-  std::shared_ptr<MessageAlloc> message_allocator_;
-  MessageDeleter message_deleter_;
 };
 
+template<typename CallbackT, typename MessageT, typename Alloc = std::allocator<MessageT>>
+std::unique_ptr<AbstractSubscriptionCallback<MessageT>> make_subscription_callback(CallbackT && cb, const Alloc && alloc = {})
+{
+  return std::make_unique<SubscriptionCallback<MessageT, Alloc, CallbackT>>(
+    std::forward(cb), std::forward(alloc));
+}
 }  // namespace rclcpp
 
 #endif  // RCLCPP__ANY_SUBSCRIPTION_CALLBACK_HPP_

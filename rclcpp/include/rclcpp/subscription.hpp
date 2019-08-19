@@ -85,7 +85,7 @@ public:
     const rosidl_message_type_support_t & type_support_handle,
     const std::string & topic_name,
     const rcl_subscription_options_t & subscription_options,
-    AnySubscriptionCallback<CallbackMessageT, Alloc> callback,
+    AnySubscriptionCallback<CallbackMessageT> callback,
     const SubscriptionEventCallbacks & event_callbacks,
     typename message_memory_strategy::MessageMemoryStrategy<CallbackMessageT, Alloc>::SharedPtr
     memory_strategy = message_memory_strategy::MessageMemoryStrategy<CallbackMessageT,
@@ -274,7 +274,7 @@ private:
 
   RCLCPP_DISABLE_COPY(Subscription)
 
-  AnySubscriptionCallback<CallbackMessageT, Alloc> any_callback_;
+  AnySubscriptionCallback<CallbackMessageT> any_callback_;
   typename message_memory_strategy::MessageMemoryStrategy<CallbackMessageT, Alloc>::SharedPtr
     message_memory_strategy_;
 };

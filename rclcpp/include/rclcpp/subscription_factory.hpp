@@ -84,23 +84,19 @@ create_subscription_factory(
   SubscriptionFactory factory;
 
   using rclcpp::AnySubscriptionCallback;
-  AnySubscriptionCallback<CallbackMessageT, Alloc> any_subscription_callback(allocator);
-  any_subscription_callback.set(std::forward<CallbackT>(callback));
-
-  auto message_alloc =
-    std::make_shared<typename Subscription<CallbackMessageT, Alloc>::MessageAlloc>();
+  AnySubscriptionCallback<MessageT> any_subscription_callback =
+    SubscriptionCallback<MessageT, CallbackT, Alloc>(callback, *allocator);
 
   // factory function that creates a MessageT specific SubscriptionT
   factory.create_typed_subscription =
-    [allocator, msg_mem_strat, any_subscription_callback, event_callbacks, message_alloc](
+    [allocator, msg_mem_strat, any_subscription_callback, event_callbacks](
     rclcpp::node_interfaces::NodeBaseInterface * node_base,
     const std::string & topic_name,
     const rcl_subscription_options_t & subscription_options
     ) -> rclcpp::SubscriptionBase::SharedPtr
     {
       auto options_copy = subscription_options;
-      options_copy.allocator =
-        rclcpp::allocator::get_rcl_allocator<CallbackMessageT>(*message_alloc.get());
+      options_copy.allocator = any_subscription_callback.get_rcl_allocator();
 
       using rclcpp::Subscription;
       using rclcpp::SubscriptionBase;
